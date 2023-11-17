@@ -95,7 +95,7 @@ func New(addr string) *Pinger {
 		Tracker:    r.Uint64(),
 
 		addr:              addr,
-		done:              make(chan bool),
+		done:              make(chan interface{}),
 		id:                r.Intn(math.MaxUint16),
 		ipaddr:            nil,
 		ipv4:              false,
@@ -137,12 +137,23 @@ type Pinger struct {
 	// Number of duplicate packets received
 	PacketsRecvDuplicates int
 
+	// Round trip time statistics
+	minRtt    time.Duration
+	maxRtt    time.Duration
+	avgRtt    time.Duration
+	stdDevRtt time.Duration
+	stddevm2  time.Duration
+	statsMu   sync.RWMutex
+
 	// If true, keep a record of rtts of all received packets.
 	// Set to false to avoid memory bloat for long running pings.
 	RecordRtts bool
 
 	// rtts is all of the Rtts
 	rtts []time.Duration
+
+	// OnSetup is called when Pinger has finished setting up the listening socket
+	OnSetup func()
 
 	// OnSend is called when Pinger sends a packet
 	OnSend func(*Packet)
@@ -165,8 +176,9 @@ type Pinger struct {
 	// Source is the source IP address
 	Source string
 
-	// stop chan bool
-	done chan bool
+	// Channel and mutex used to communicate when the Pinger should stop between goroutines.
+	done chan interface{}
+	lock sync.Mutex
 
 	ipaddr *net.IPAddr
 	addr   string
@@ -245,6 +257,34 @@ type Statistics struct {
 	// StdDevRtt is the standard deviation of the round-trip times sent via
 	// this pinger.
 	StdDevRtt time.Duration
+}
+
+func (p *Pinger) updateStatistics(pkt *Packet) {
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
+
+	p.PacketsRecv++
+	if p.RecordRtts {
+		p.rtts = append(p.rtts, pkt.Rtt)
+	}
+
+	if p.PacketsRecv == 1 || pkt.Rtt < p.minRtt {
+		p.minRtt = pkt.Rtt
+	}
+
+	if pkt.Rtt > p.maxRtt {
+		p.maxRtt = pkt.Rtt
+	}
+
+	pktCount := time.Duration(p.PacketsRecv)
+	// welford's online method for stddev
+	// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+	delta := pkt.Rtt - p.avgRtt
+	p.avgRtt += delta / pktCount
+	delta2 := pkt.Rtt - p.avgRtt
+	p.stddevm2 += delta * delta2
+
+	p.stdDevRtt = time.Duration(math.Sqrt(float64(p.stddevm2 / pktCount)))
 }
 
 // SetIPAddr sets the ip address of the target host.
@@ -364,51 +404,66 @@ func (p *Pinger) Run() error {
 	//nolint:errcheck
 	go p.recvICMP(conn, recv, &wg)
 
+	if handler := p.OnSetup; handler != nil {
+		handler()
+	}
+
+	timeout := time.NewTicker(p.Timeout)
+	interval := time.NewTicker(p.Interval)
+	defer func() {
+		p.Stop()
+		interval.Stop()
+		timeout.Stop()
+		wg.Wait()
+	}()
+
 	err = p.sendICMP(conn)
 	if err != nil {
 		return err
 	}
 
-	timeout := time.NewTicker(p.Timeout)
-	defer timeout.Stop()
-	interval := time.NewTicker(p.Interval)
-	defer interval.Stop()
-
 	for {
 		select {
 		case <-p.done:
-			wg.Wait()
 			return nil
 		case <-timeout.C:
-			close(p.done)
-			wg.Wait()
 			return nil
+		case r := <-recv:
+			err := p.processPacket(r)
+			if err != nil {
+				// FIXME: this logs as FATAL but continues
+				fmt.Println("FATAL:", err)
+			}
 		case <-interval.C:
 			if p.Count > 0 && p.PacketsSent >= p.Count {
+				interval.Stop()
 				continue
 			}
 			err = p.sendICMP(conn)
 			if err != nil {
 				// FIXME: this logs as FATAL but continues
-				fmt.Println("FATAL: ", err.Error())
-			}
-		case r := <-recv:
-			err := p.processPacket(r)
-			if err != nil {
-				// FIXME: this logs as FATAL but continues
-				fmt.Println("FATAL: ", err.Error())
+				fmt.Println("FATAL:", err)
 			}
 		}
 		if p.Count > 0 && p.PacketsRecv >= p.Count {
-			close(p.done)
-			wg.Wait()
 			return nil
 		}
 	}
 }
 
 func (p *Pinger) Stop() {
-	close(p.done)
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	open := true
+	select {
+	case _, open = <-p.done:
+	default:
+	}
+
+	if open {
+		close(p.done)
+	}
 }
 
 func (p *Pinger) finish() {
@@ -423,40 +478,22 @@ func (p *Pinger) finish() {
 // pinger is running or after it is finished. OnFinish calls this function to
 // get it's finished statistics.
 func (p *Pinger) Statistics() *Statistics {
-	loss := float64(p.PacketsSent-p.PacketsRecv) / float64(p.PacketsSent) * 100
-	var min, max, total time.Duration
-	if len(p.rtts) > 0 {
-		min = p.rtts[0]
-		max = p.rtts[0]
-	}
-	for _, rtt := range p.rtts {
-		if rtt < min {
-			min = rtt
-		}
-		if rtt > max {
-			max = rtt
-		}
-		total += rtt
-	}
+	p.statsMu.RLock()
+	defer p.statsMu.RUnlock()
+	sent := p.PacketsSent
+	loss := float64(sent-p.PacketsRecv) / float64(sent) * 100
 	s := Statistics{
-		PacketsSent:           p.PacketsSent,
+		PacketsSent:           sent,
 		PacketsRecv:           p.PacketsRecv,
 		PacketsRecvDuplicates: p.PacketsRecvDuplicates,
 		PacketLoss:            loss,
 		Rtts:                  p.rtts,
 		Addr:                  p.addr,
 		IPAddr:                p.ipaddr,
-		MaxRtt:                max,
-		MinRtt:                min,
-	}
-	if len(p.rtts) > 0 {
-		s.AvgRtt = total / time.Duration(len(p.rtts))
-		var sumsquares time.Duration
-		for _, rtt := range p.rtts {
-			sumsquares += (rtt - s.AvgRtt) * (rtt - s.AvgRtt)
-		}
-		s.StdDevRtt = time.Duration(math.Sqrt(
-			float64(sumsquares / time.Duration(len(p.rtts)))))
+		MaxRtt:                p.maxRtt,
+		MinRtt:                p.minRtt,
+		AvgRtt:                p.avgRtt,
+		StdDevRtt:             p.stdDevRtt,
 	}
 	return &s
 }
@@ -497,7 +534,7 @@ func (p *Pinger) recvICMP(
 						// Read timeout
 						continue
 					} else {
-						close(p.done)
+						p.Stop()
 						return err
 					}
 				}
@@ -524,7 +561,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 	var m *icmp.Message
 	var err error
 	if m, err = icmp.ParseMessage(proto, recv.bytes); err != nil {
-		return fmt.Errorf("error parsing icmp message: %s", err.Error())
+		return fmt.Errorf("error parsing icmp message: %w", err)
 	}
 
 	if m.Type != ipv4.ICMPTypeEchoReply && m.Type != ipv6.ICMPTypeEchoReply {
@@ -532,7 +569,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 		return nil
 	}
 
-	outPkt := &Packet{
+	inPkt := &Packet{
 		Nbytes: recv.nbytes,
 		IPAddr: p.ipaddr,
 		Addr:   p.addr,
@@ -541,8 +578,7 @@ func (p *Pinger) processPacket(recv *packet) error {
 
 	switch pkt := m.Body.(type) {
 	case *icmp.Echo:
-		// Check if the reply has the ID we expect.
-		if pkt.ID != p.id {
+		if !p.matchID(pkt.ID) {
 			return nil
 		}
 
@@ -558,30 +594,27 @@ func (p *Pinger) processPacket(recv *packet) error {
 			return nil
 		}
 
-		outPkt.Rtt = receivedAt.Sub(timestamp)
-		outPkt.Seq = pkt.Seq
+		inPkt.Rtt = receivedAt.Sub(timestamp)
+		inPkt.Seq = pkt.Seq
 		// If we've already received this sequence, ignore it.
 		if _, inflight := p.awaitingSequences[pkt.Seq]; !inflight {
 			p.PacketsRecvDuplicates++
 			if p.OnDuplicateRecv != nil {
-				p.OnDuplicateRecv(outPkt)
+				p.OnDuplicateRecv(inPkt)
 			}
 			return nil
 		}
 		// remove it from the list of sequences we're waiting for so we don't get duplicates.
 		delete(p.awaitingSequences, pkt.Seq)
-		p.PacketsRecv++
+		p.updateStatistics(inPkt)
 	default:
 		// Very bad, not sure how this can happen
 		return fmt.Errorf("invalid ICMP echo reply; type: '%T', '%v'", pkt, pkt)
 	}
 
-	if p.RecordRtts {
-		p.rtts = append(p.rtts, outPkt.Rtt)
-	}
 	handler := p.OnRecv
 	if handler != nil {
-		handler(outPkt)
+		handler(inPkt)
 	}
 
 	return nil
@@ -653,7 +686,7 @@ func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
 func (p *Pinger) listen(netProto string) (*icmp.PacketConn, error) {
 	conn, err := icmp.ListenPacket(netProto, p.Source)
 	if err != nil {
-		close(p.done)
+		p.Stop()
 		return nil, err
 	}
 	return conn, nil
